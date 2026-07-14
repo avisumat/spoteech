@@ -1,0 +1,20 @@
+# Python virtual environments
+.myenv/
+venv/
+__pycache__/
+*.pyc
+
+# Local IDE settings
+.vscode/
+.idea/
+
+# Application logs
+*.log
+uvicorn-*.log
+
+# Local test data
+tests/
+
+#api keys and db passwords
+.env
+
