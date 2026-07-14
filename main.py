@@ -1,0 +1,1252 @@
+import config
+#this helps in bringing all the variables from config.py
+from starlette.middleware.cors import CORSMiddleware
+#browsers have a security feature called CORS(cross origin resources sharing).they block Html file from talking to our api unless we explicitly allow it
+from fastapi import FastAPI,UploadFile,File
+#the fastapi import
+from fastapi.responses import RedirectResponse, JSONResponse
+#this import helps in the redirection of the user to spotify
+# authorization page otherwise the process
+#we know as URL encode
+import urllib.parse
+#this is used to convert the params for the query string from a dictionary format
+import httpx
+#this is a replacement or more modern form of requests library used to make HTTP requests in async bodies as well
+
+import base64
+#this is used to encode the access_token and the client secret
+import secrets
+
+#instead of manually handling the data validation part,we can let fastapi
+#automatically validate the data itself
+from fastapi import HTTPException,status
+from fastapi import Request
+import time
+from starlette.middleware.sessions import SessionMiddleware
+#this is used to store all the details of access_token,expiry,refresh_token
+#and the secret_key(used for secure sign in for session cookies)
+
+#SessionMiddleware is a premade middleware which we added directly from starlette.middleware.sessions
+#FastAPI just sits on top of the middleware
+
+from fastapi import Depends
+#Depends is used to make a dependency injection which helps us to reuse the logic for accessing token
+#and maybe validating the user even
+
+from agent import get_agent_response
+#we are importing the function from agent.py to connect the agent to backend
+from pydantic import BaseModel
+#we are using this for validation of body in post request
+
+from spotify_client import play_spotify_tracks,search_spotify_api,fetch_user_playlists
+from test_shazam import identify_audio
+import json
+from typing import Optional
+#the docstring is attached to this file for better understanding what each scope does
+from fastapi import APIRouter, HTTPException, Header
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, List,Literal
+import httpx
+from fastapi import WebSocket,WebSocketDisconnect
+import uuid
+import re
+import spotify_client
+
+scope=(
+    "user-read-private "
+    "user-read-email "
+    "user-read-recently-played "
+    "user-top-read "
+    "user-library-read "
+    "user-library-modify "
+    "playlist-read-private "
+    "playlist-read-collaborative "
+    "playlist-modify-public "
+    "playlist-modify-private "
+    "user-modify-playback-state "
+    "user-read-playback-state "
+    "user-read-currently-playing "
+    "app-remote-control "
+    "streaming"
+)
+#auth_url is supposed to be used at the login endpoint for authorization
+auth_url = 'https://accounts.spotify.com/authorize'
+token_url = 'https://accounts.spotify.com/api/token'
+expected_state='weekndftwdangit8238777'
+frontend_url = getattr(config, "FRONTEND_URL", None) or "http://127.0.0.1:5173"
+app = FastAPI()
+
+token_vault={}
+#this token vault is a dictionary which shall be later added to Redis
+#problem with http.request.session is that developer tools, makes the token visible
+#any user's access_token gives full access of user account to attacker, although spotify handles
+#the request by checking many things apart from only access_token, its still better to 
+#encode it somewhere else 
+agent_command_rate_limit = {}
+
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=config.SECRET_KEY,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:5500",
+        "http://localhost:5500"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# we will be sending a json to our frontend, but from agent.py we are receiving pydantic model
+from agent import NormalisedSchema,SpotifySearchType,normalize_spotify_data
+class FrontendResponse(BaseModel):
+    status:str
+    data:List[NormalisedSchema]
+    ui_mood:Literal["energetic", "chill", "melancholy", "focus", "neutral"]="neutral"
+    uri:str|None
+    name:str|None=None
+    subtitle:str|None #this is the subtitle
+    coverart:str|None
+    type:SpotifySearchType|None #whether it is track,playlist,album, or artist
+    action:str|None
+    has_next:bool=False #pagination, has next page
+    offset:int=0 #pagination
+    remaining:int=0 #pagination
+
+@app.get("/")
+async def authenticate():
+    return RedirectResponse("/login")
+
+
+@app.get('/login')
+async def login():
+
+    params = {
+        'client_id': config.SPOTIFY_CLIENT_ID,
+        'response_type': 'code',
+        'redirect_uri': config.REDIRECT_URI,
+        'state': expected_state,
+        'scope': scope
+    }
+    #the following converts the dictionary into an encoded string which
+    #we can finally attach or append to the auth_url to make the
+    #complete url
+
+    encoded_params =urllib.parse.urlencode(params)
+
+    #URL encode the parameters and create the final URL
+    auth_url_param = f"{auth_url}?{encoded_params}"
+    #this will redirect us to spotify authorize using a status code 307
+    #to temporary redirect and then finally coming back to our application
+    # once the authorization is complete. one point to note is that no
+    #data exchange takes place in this function
+    print(auth_url_param)
+    return RedirectResponse(url=auth_url_param)
+
+
+
+@app.get("/callback")
+async def callback(request: Request,code:str=None, state:str=None, error:str=None):
+    #the request here is a python object which converted the messy HTTP request into a clean python
+    #dictionary so that we can perform => request.headers, request.cookies,request.query_params,
+    #await request.body() and also finally a session creation from middleware request.session
+    #the .session helps the browser or our app remember the user and not just forget the user at every session
+
+    # 1. checking if both code and str and valid or not and only
+    # then proceeding to avoid bad method
+
+    if error is not None:
+        raise HTTPException(status_code=400, detail=f"spotify_error:{error}")
+    if code is None:
+        raise HTTPException(status_code=400, detail="missing_code")
+    if state is None:
+        raise HTTPException(status_code=400, detail="missing_state")
+    if state != expected_state:
+        raise HTTPException(status_code=400, detail="state_mismatch")
+    try:
+
+        # 2.preparation of the basic auth_header
+        # since it's a post request we have sent the data in request's body
+        # not the URL
+        auth_string = f"{config.SPOTIFY_CLIENT_ID}:{config.SPOTIFY_CLIENT_SECRET}"
+        auth_enc8 = auth_string.encode("utf-8")
+        auth_b64 = base64.b64encode(auth_enc8)
+        auth_b64f = auth_b64.decode("utf-8")
+
+
+
+        headers={
+            'Content-type' : 'application/x-www-form-urlencoded',
+            'Authorization' : f'Basic {auth_b64f}'
+        }
+        data={
+            'grant_type': 'authorization_code',
+            'code' : code,
+            'redirect_uri':config.REDIRECT_URI
+        }
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url=token_url,headers= headers,data=data)
+
+            resp.raise_for_status() #raise an exception if any bad status codes 4xx/5xx
+            token_data = resp.json()
+            #we now fetch the access_tokens, refresh_tokens and their expiry time
+            request.session["access_token"]= token_data["access_token"]
+            if "refresh_token" in token_data:
+                request.session["refresh_token"] = token_data["refresh_token"]
+
+
+            #calculates the exact time when the token expires
+            #time.time() indicates float number which is time passed since the last epoch
+            #that is since jan1 1970 how many seconds have elapsed  we then convert it to int to
+            #not make it complex using milliseconds as well
+            request.session["expires_at"]= int(time.time()) + token_data['expires_in']
+            api_key = secrets.token_urlsafe(32)
+            token_vault[api_key] = {
+                "access_token": token_data["access_token"],
+                "refresh_token": token_data.get("refresh_token"),
+                "expires_at": int(time.time()) + token_data["expires_in"]
+            }
+            redirect_params = urllib.parse.urlencode({"api_key": api_key})
+            return RedirectResponse(url=f"{frontend_url.rstrip('/')}?{redirect_params}")
+
+    except httpx.HTTPStatusError as e:
+        #for bad status codes like 4xx/5xx
+        raise HTTPException(status_code=e.response.status_code, detail=f"Error from Spotify: {e.response.text}")
+    except httpx.RequestError as e:
+        # Network or connection error
+        raise HTTPException(status_code=502, detail=f"Network error contacting Spotify: {str(e)}")
+
+
+# def get_login_redirect_exception():
+#     #this function returns an HTTP exception that will cause a 307 temporary redirect to the /login
+#     #endpoint
+#     return HTTPException(
+#         status_code=307,
+#         detail="Not authenticated",
+#         headers={"location" : "/login"}
+#     )
+#
+# #the function below is the core dependency function which checks if access_token is good or not
+# #if not good then it sends the user to login endpoint by returning a string in the get_login_redirect_exception
+# #and then through that making a request
+# async def get_valid_token(request: Request) -> str:
+#     access_token = request.session.get("access_token")
+#     if access_token is None:
+#         raise get_login_redirect_exception()
+#     if request.session.get("expires_at") <= int(time.time()):
+#         refresh_token = request.session.get("refresh_token")
+#         if refresh_token is None:
+#             raise get_login_redirect_exception()
+#         try:
+#             # call the helper function that is refresh_spotify_token() where a POST request is made
+#             new_token_data= await refresh_spotify_token(refresh_token)
+#             # we now need to access the new token received if any from spotify and update this in
+#             # the request.session we made, this is the persistent connection that remembers users
+#             request.session["access_token"] = new_token_data["access_token"]
+#             request.session["expires_at"] = int(time.time()) +new_token_data["expires_in"]
+#
+#             #for some reason if spotify gives a new refresh token then update it in request.session
+#             if "refresh_token" in new_token_data:
+#                 request.session["refresh_token"] = new_token_data["refresh_token"]
+#
+#             return new_token_data["access_token"]
+#
+#         except:
+#             #if everything else fails then login from step 1 again
+#             raise get_login_redirect_exception()
+#
+#     return access_token
+
+
+#here the reason for us making the exception in one function and then raising it here is that
+#if it were not there we would have to raise with the HTTPException(
+    #     status_code=307,
+    #     detail="Not authenticated",
+    #     headers={"location" : "/login"}
+    # ) everytime so to use the DRY principle we are writing it another function independently
+async def get_valid_token(request: Request) -> str:
+    """
+    Dependency that checks for a valid token.
+    If invalid, it raises a 401 Error.
+    The Frontend will see the 401 and redirect the user manually.
+    """
+    #strategy 1 : check Authorization Header --
+    #NOTE BY ABHISUMAT-> this checks with similarity search if Authorization is written then immediately
+    #take it and we get the access token
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        vault_tokens = token_vault.get(token)
+        if vault_tokens:
+            if vault_tokens.get("expires_at", 0) <= int(time.time()):
+                refresh_token = vault_tokens.get("refresh_token")
+                if refresh_token is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Session expired"
+                    )
+                try:
+                    new_token_data = await refresh_spotify_token(refresh_token)
+                    vault_tokens["access_token"] = new_token_data["access_token"]
+                    vault_tokens["expires_at"] = int(time.time()) + new_token_data["expires_in"]
+
+                    if "refresh_token" in new_token_data:
+                        vault_tokens["refresh_token"] = new_token_data["refresh_token"]
+
+                except Exception:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Authentication failed"
+                    )
+            return vault_tokens["access_token"]
+        if token.startswith("BQ") or len(token) > 80:
+            return token
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key or expired session"
+        )
+    # 1. Check Session for Token
+    access_token = request.session.get("access_token")
+
+    if access_token is None:
+        #  Return 401 instead of Redirecting
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated"
+        )
+
+    # 2. Check Expiry
+    #NOTE BY ABHISUMAT(dev) -> this function looks for token in session cookie but fetch or frontend
+    #does not send cookies by default so this backend sees None in the session and assumes we are logged
+    #out, hence throwing a 401 UNAUTHORIZED and then loop continues
+    if request.session.get("expires_at",0) <= int(time.time()):
+        refresh_token = request.session.get("refresh_token")
+        if refresh_token is None:
+            # Return 401
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired"
+            )
+        try:
+            # Refresh the token
+            new_token_data = await refresh_spotify_token(refresh_token)
+
+            # Update Session
+            request.session["access_token"] = new_token_data["access_token"]
+            request.session["expires_at"] = int(time.time()) + new_token_data["expires_in"]
+
+            if "refresh_token" in new_token_data:
+                request.session["refresh_token"] = new_token_data["refresh_token"]
+
+            return new_token_data["access_token"]
+
+        except Exception:
+            #If refresh fails, Return 401
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication failed"
+            )
+
+    return access_token
+
+
+#for the refresh token a post request is to be made with parameters
+async def refresh_spotify_token(refresh_token:str) -> dict:
+    auth_string = f"{config.SPOTIFY_CLIENT_ID}:{config.SPOTIFY_CLIENT_SECRET}"
+    auth_enc8 = auth_string.encode("utf-8")
+    auth_b64 = base64.b64encode(auth_enc8)
+    auth_b64f = auth_b64.decode("utf-8")
+    data = {
+        "grant_type" : "refresh_token",
+        "refresh_token" : refresh_token,
+        "client_id":config.SPOTIFY_CLIENT_ID
+    }
+    headers={
+        "content-Type":"application/x-www-form-urlencoded",
+        "Authorization" : f"Basic {auth_b64f}"
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url= token_url,headers= headers,data= data)
+        resp.raise_for_status()
+        token_data= resp.json()
+        return dict(token_data)
+
+
+class UserProfileResponse(BaseModel):
+    user_id:str
+    username:str|None
+    email: str|None
+    account_type:str|None
+    country:str|None
+    spotify_profile:str|None
+    followers: int
+    cover_art:str|None
+
+
+@app.get("/api/me")
+@app.get("/me",
+         response_model=UserProfileResponse)
+async def get_user_profile(access_token : str=Depends(get_valid_token)):
+    #we made a request object which converted the actual request http response into a python object
+    #request.session is to make the session
+
+
+    #if none of the above cases were met then it means we have a valid access_token, and we can use it
+    #to get the user's profile
+    #the header is added because according to spotify docs -
+    #to use the access token you must include the following header in your API calls:
+    #header parameter => Authorization , value=> valid access token with the format: Bearer <Access Token>
+    #Note that the access token is valid for 1 hour(3600 seconds).After that time, the token expires and
+    # you need to request a new one.
+    profile_url = "https://api.spotify.com/v1/me"
+    headers={"Authorization":f"Bearer {access_token}"}
+    #now using this header we make a GET request
+    #for testing purposes we use the access token to fetch the user info at start calling the following
+    print(f"DEBUG: Using these headers: {headers}")
+    print(f"profile url  = {profile_url}")
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url=profile_url,headers=headers)
+    #it is to be noted that once we are out of the scope of the client session the client immediately
+    #closes all the open connections so if we were to make a request using client outside the scope
+    #it would fail
+    if resp.status_code !=200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail =resp.json()
+        )
+    spotify_user = resp.json()
+    #the below return statement will have to go to frontend for rendering the user card 
+    return{
+        "user_id":spotify_user.get("id"),
+        "username": spotify_user.get("display_name"),
+        "account_type": spotify_user.get("product"),
+        "followers": spotify_user.get("followers",{}).get("total",0),
+        "spotify_profile": spotify_user.get("external_urls",{}).get("spotify"),
+        "cover_art" :(
+            #spotify index 0 has the highest resolution photos
+            spotify_user["images"][0]["url"]
+            if spotify_user.get("images")
+            else None
+        )
+    }
+
+@app.get("/playlists")
+async def get_user_playlists(access_token:str=Depends(get_valid_token)):
+    raw_data= await fetch_user_playlists(access_token)
+
+    wrapped_data ={
+        "playlists": raw_data
+    }
+    normalized_data= normalize_spotify_data(wrapped_data)
+    #attach all results to frontendresponse and send it 
+
+    return FrontendResponse(
+        status="success",
+        data=normalized_data,
+        action="render",
+    )
+
+@app.get("/recent")
+async def get_recent_tracks(access_token:str=Depends(get_valid_token)):
+    raw_data = await spotify_client.fetch_recent_tracks(access_token)
+
+    req_raw_data = raw_data.get("items",[]) #this is a list of a items where each element is dict
+    send_norm_data= [item.get("track") for item in req_raw_data if item.get("track")]
+    wrapped_data= {
+        "tracks":{
+            "items": send_norm_data
+        }
+    }
+
+    normalized_data=normalize_spotify_data(raw_data=wrapped_data)
+
+    return FrontendResponse(
+        status="success",
+        data=normalized_data,
+        action="render"
+    )  
+
+@app.get("/api/generate_music", response_model=FrontendResponse)
+async def get_result_tracks(prompt: str, access_token: str = Depends(get_valid_token)):
+    """
+    1. validates the user (Dependency injection)
+    2. calls the AI agent
+    3. Returns the songs strictly using the universal UI contract
+    """
+    try:
+        agent_data = await get_agent_response(usr_input=prompt, access_token=access_token)
+        
+        if not agent_data or not agent_data.get("search_results"):
+            return FrontendResponse(
+                status="error",
+                data=[],
+                action="render"
+            )
+
+        # The agent already normalizes this data, so we just extract it safely
+        ndata = agent_data.get("search_results", [])
+        top_hit = ndata[0] if ndata else None
+
+        return FrontendResponse(
+            status="success",
+            data=ndata,
+            ui_mood=agent_data.get("ui_mood", "neutral"),
+            intent=agent_data.get("intent", "search"),
+            uri=top_hit.uri if top_hit else None,
+            name=top_hit.name if top_hit else None,
+            subtitle=top_hit.subtitle if top_hit else None,
+            coverart=top_hit.image if top_hit else None,
+            type=top_hit.type if top_hit else SpotifySearchType.TRACK,
+            action="render"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+class PlayRequest(BaseModel):
+    items:list #the list of song dictionaries
+    intent:str #whether the request was individual or queue
+    device_id:Optional[str]=None
+
+@app.post("/api/play_command")
+async def play_music(request:PlayRequest,token:str=Depends(get_valid_token)):
+    """
+    recieves a list of songs and intent, then commands spotify to play them
+    """
+    try:
+        response = await play_spotify_tracks(items=request.items,token=token,intent=request.intent,device_id=request.device_id)
+        return {"status":"success","message":"playback started"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500,detail=str(e))
+
+from fastapi import File, UploadFile, Request, Depends, HTTPException
+# Ensure you import your Spotify client, normalizer, and FrontendResponse models here
+
+@app.post("/api/identify_audio", response_model=FrontendResponse)
+async def handle_audio_identification(
+    request: Request, 
+    audio_blob: UploadFile = File(...), 
+    access_token: str = Depends(get_valid_token)
+):
+    try:
+        #Read the raw bytes from the microphone upload
+        audio_bytes = await audio_blob.read()
+
+        #Pass bytes to your hardened Shazam identifier
+        result = await identify_audio(file_bytes=audio_bytes)
+
+        if result.get("status") == "error":
+            raise HTTPException(status_code=400, detail=result.get("message"))
+
+        #Use the Shazam query to search Spotify for the actual playable track
+        search_query = result.get("spotify_search_query")
+        top_hit = None
+        
+        if search_query:
+            # Note: adjust this call to exactly match however your spotify_client does searches
+            raw_spotify_results = await spotify_client.search_spotify(
+                query=search_query, 
+                search_types=["track"], 
+                access_token=access_token
+            )
+            
+            # Extract tracks and normalize them using your universal function
+            tracks = raw_spotify_results.get("tracks", {}).get("items", [])
+            if tracks:
+                wrapped_data = {"tracks": {"items": tracks}}
+                normalized_list = normalize_spotify_data(wrapped_data)
+                top_hit = normalized_list[0] if normalized_list else None
+
+        #Data Mapping with Fallback Strategy
+        if top_hit:
+            # We found it on Spotify! Use the playable, high-quality Spotify data
+            final_name = top_hit.name
+            final_subtitle = top_hit.subtitle
+            final_coverart = top_hit.image
+            final_uri = top_hit.uri
+        else:
+            # Spotify missed it, or Shazam didn't generate a Spotify query.
+            # Fallback to pure Shazam metadata (it just won't be playable)
+            final_name = result.get("title")
+            final_subtitle = result.get("artist")
+            final_coverart = result.get("coverart") 
+            final_uri = None 
+
+        #Ship it via the Universal Contract
+        return FrontendResponse(
+            status="success",
+            action="render",
+            data=[], # No list needed, it's a single item view
+            intent="identify", # Let React know this was an audio match
+            name=final_name,
+            subtitle=final_subtitle,
+            coverart=final_coverart,
+            uri=final_uri,
+            type=SpotifySearchType.TRACK
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+AGENT_COMMAND_RATE_LIMIT_COUNT = 6
+AGENT_COMMAND_RATE_LIMIT_WINDOW = 60
+AGENT_COMMAND_MAX_LENGTH = 240
+
+def _agent_command_rate_key(request: Request) -> str:
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+    return request.client.host if request.client else "unknown-client"
+
+def _enforce_agent_command_rate_limit(request: Request):
+    now = time.time()
+    rate_key = _agent_command_rate_key(request)
+    window_start = now - AGENT_COMMAND_RATE_LIMIT_WINDOW
+    timestamps = [stamp for stamp in agent_command_rate_limit.get(rate_key, []) if stamp > window_start]
+
+    if len(timestamps) >= AGENT_COMMAND_RATE_LIMIT_COUNT:
+        retry_after = max(1, int(AGENT_COMMAND_RATE_LIMIT_WINDOW - (now - timestamps[0])))
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many DJ commands. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    timestamps.append(now)
+    agent_command_rate_limit[rate_key] = timestamps
+
+    for key, values in list(agent_command_rate_limit.items()):
+        active_values = [stamp for stamp in values if stamp > window_start]
+        if active_values:
+            agent_command_rate_limit[key] = active_values
+        else:
+            agent_command_rate_limit.pop(key, None)
+
+class VoiceCommand(BaseModel):
+    command : str = Field(..., min_length=2, max_length=AGENT_COMMAND_MAX_LENGTH)# i have to remember that from frontend i will have to send json in this format only
+
+    @field_validator("command")
+    @classmethod
+    def clean_command(cls, value: str) -> str:
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", value or "")
+        cleaned = re.sub(r"(--|/\*|\*/|;)", " ", cleaned)
+        cleaned = re.sub(
+            r"\b(drop\s+table|delete\s+from|insert\s+into|union\s+select|alter\s+table|truncate\s+table)\b",
+            "",
+            cleaned,
+            flags=re.IGNORECASE
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        if len(cleaned) < 2:
+            raise ValueError("Voice command is empty after validation")
+        
+        return cleaned
+
+    
+@app.post("/api/agent_command",response_model=FrontendResponse)
+async def voice_command(request:Request, data:VoiceCommand, access_token:str=Depends(get_valid_token)):
+    """
+    this is there for a current playing or now playing, the full data is sent to frontend seperately as well
+    this endpoint is purely for playing what the user most likely searched for
+    plays the top song on the list of results we got
+    """
+    if not access_token:
+        raise HTTPException(status_code=401,detail="user is not authorised or authenticated")
+    _enforce_agent_command_rate_limit(request)
+    usr_inp = data.command
+
+    response  = await get_agent_response(access_token=access_token,
+                                         usr_input = usr_inp)
+    if not response or not response.get("normalised_results"):
+        raise HTTPException(status_code=404,detail="AI couldn't find any music matching your vibe!YOU DA real vibe!!!")
+
+    ndata = response.get("normalised_results",[])#this is a list not an object
+    top_hit = ndata[0] if ndata else None
+
+    uri = top_hit.uri if top_hit else None
+    title=top_hit.name if top_hit else None
+    subtitle= top_hit.subtitle if top_hit else None
+    coverart= top_hit.image if top_hit else None
+
+    return FrontendResponse(
+        status="success",
+        data=ndata,#thisis the fulldata we are giving to frontend for rendering the list
+        type=response.get("intent"),
+        ui_mood=response.get("ui_mood"),
+        name=title,
+        uri=uri ,
+        subtitle=subtitle,
+        coverart=coverart
+    )
+
+@app.get("/api/devices")
+async def get_available_devices(request: Request, token:str=Depends(get_valid_token)):
+    if not token:
+        raise HTTPException(status_code=401, detail="User is not authorized or authenticated")
+
+    url = "https://api.spotify.com/v1/me/player/devices"
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url=url, headers=headers)
+
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Spotify Token Expired")
+
+            #JSON Extraction
+            if response.status_code == 200:
+                data = response.json()
+                raw_devices = data.get("devices", [])
+
+                # Filtering: Only send exactly what the frontend needs
+                clean_devices = []
+                for d in raw_devices:
+                    # We skip devices without IDs (sometimes local restricted sessions do this)
+                    if not d.get("id"):
+                        continue
+
+                    clean_devices.append({
+                        "id": d.get("id"),
+                        "name": d.get("name"),
+                        "type": d.get("type"),
+                        "is_active": d.get("is_active")
+                    })
+
+                return {"status": "success", "devices": clean_devices}
+            else:
+                return {"status": "error", "devices": []}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"NETWORK ERROR fetching devices: {e}")
+            raise HTTPException(status_code=500, detail="Failed to fetch devices from Spotify")
+
+class track_essentials(BaseModel):
+    uri:Optional[str]=None
+    intent:Optional[str]=None #helps in checking which type of music we are playing i.e. track, playlist or sometihng else
+    device_id:Optional[str]=None
+    user_requested_specific_song : bool=True #it is important to note that the user might wanna simply
+    #resume the song he/she was listening to, hence this specific boolean variable exists to check
+    #whether the user is actually requesting to play a new song or simply resume
+    #the logic of finding this intent however will and must be handled in langgraph agent node
+    #IMPORTANT : best case to handle this if the user says "resume" then langgraph node must understand
+    #that this is a request to just resume the music playing on active device without making an LLM invocation
+    offset: int=0
+
+
+@app.post("/api/play")
+async def play_music(model:track_essentials,request:Request,access_token:str=Depends(get_valid_token)):
+    #NOTE: the request body is optional, if the request body doesnt exist then spotify starts playing
+    #whatever was played last without any issue
+    if not access_token:
+        raise HTTPException(status_code=401,detail="access_token is expired")
+
+    url="https://api.spotify.com/v1/me/player/play"
+    device_id=model.device_id
+    #DEVICE ID WILL NEVER BE NONE BECAUSE WE ALREADY SORTED IT OUT IN "GET_AVAILABLE DEVICES"
+    header = {
+        "Authorization": f"Bearer {access_token}",
+        "content-Type":"application/json"
+    }
+    query_params={}
+    if model.device_id:
+        query_params["device_id"] =device_id
+
+    request_body={}
+    if model.user_requested_specific_song:
+        if not model.uri:
+            raise HTTPException(status_code=400,detail="URI is required for a new song request")
+
+        if model.intent== "individual":
+            request_body={"uris" : [model.uri]}
+        else:
+            #if the user has requested something, and it is an album or playlist then we see context_uri
+            #and finally offset. NOTE: offset tells e.g. if there are 10 items in the album which one to play
+            #the user can see the list of tracks in the album and playlist and can decide which one to play
+            request_body={"context_uri":model.uri,
+                          "offset" : {
+                              "position":model.offset
+                          }
+                          }
+    else:
+        #if user_requested_specific song is false means user wants to resume playback, hence we leave
+        #request body empty as it already is
+        pass
+    async with httpx.AsyncClient() as client:
+        try:
+            if model.device_id:
+                transfer_response = await client.put(
+                    url="https://api.spotify.com/v1/me/player",
+                    headers=header,
+                    json={"device_ids": [model.device_id], "play": False}
+                )
+                if transfer_response.status_code not in (200, 204):
+                    print(f"DEVICE TRANSFER FAILURE... with status code : {transfer_response.status_code}")
+
+            response =await client.put(url=url,headers=header,params=query_params,json=request_body)
+
+            #spotify will return a 204 No content for successful playback triggers
+            if response.status_code in (200, 204):
+                return {"status": "success", "message": "Playback started"}
+            elif response.status_code == 404:
+                raise HTTPException(status_code=404, detail="No active device found.")
+            elif response.status_code == 403:
+                raise HTTPException(status_code=403, detail="Spotify Premium required or device restricted.")
+            else:
+                raise HTTPException(status_code=response.status_code, detail=f"Spotify API Error: {response.text}")
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"Network error during playback: {e}")
+            raise HTTPException(status_code=500, detail="Internal Server Error during playback")
+
+
+@app.get("/api/albums/{album_id}/tracks", response_model=FrontendResponse)
+async def get_album_tracks(album_id: str, limit: int, offset: int, access_token: str = Depends(get_valid_token)):
+    try:
+        raw_data = await spotify_client.fetch_album_tracks(album_id, limit, offset, access_token)
+        
+        # Pagination Math
+        total = raw_data.get("total", 0)
+        has_next = raw_data.get("next") is not None
+        new_offset = offset + limit
+        remaining = max(0, total - new_offset)
+
+        # Album tracks are direct (no nested "track" key), so we just wrap the items array directly
+        wrapped_data = {"tracks": {"items": raw_data.get("items", [])}}
+        normalized_data = normalize_spotify_data(wrapped_data)
+        
+        return FrontendResponse(
+            status="success",
+            action="render",
+            data=normalized_data,
+            has_next=has_next,
+            offset=new_offset,
+            remaining=remaining
+        )
+    except HTTPException:
+        raise    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal Server Error - {str(e)}")
+
+
+@app.get("/api/playlists/{playlist_id}/tracks", response_model=FrontendResponse)
+async def get_playlist_tracks(playlist_id: str, limit: int, offset: int, access_token: str = Depends(get_valid_token)):
+    try:
+        raw_data = await spotify_client.fetch_playlist_tracks(playlist_id, limit, offset, access_token)
+        
+        # Pagination Math
+        total = raw_data.get("total", 0)
+        has_next = raw_data.get("next") is not None
+        new_offset = offset + limit
+        remaining = max(0, total - new_offset)
+
+        # Playlist tracks are nested. Pluck the inner "track" object first!
+        pure_tracks = [item.get("track") for item in raw_data.get("items", []) if item.get("track")]
+        wrapped_data = {"tracks": {"items": pure_tracks}}
+        
+        normalized_data = normalize_spotify_data(wrapped_data)
+        
+        return FrontendResponse(
+            status="success",
+            action="render",
+            data=normalized_data,
+            has_next=has_next,
+            offset=new_offset,
+            remaining=remaining
+        )
+    except HTTPException:
+        raise    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal Server Error - {str(e)}")
+
+# Helper function to authenticate requests and fetch the Spotify token from the vault
+async def _get_spotify_token(authorization: str) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    api_key = authorization.split("Bearer ", 1)[1].strip()
+    user_tokens = token_vault.get(api_key) # Assuming token_vault is your global dict
+    if not user_tokens:
+        if api_key.startswith("BQ") or len(api_key) > 80:
+            return api_key
+        raise HTTPException(status_code=401, detail="Invalid API Key or expired session")
+    if user_tokens.get("expires_at", 0) <= int(time.time()):
+        refresh_token = user_tokens.get("refresh_token")
+        if refresh_token is None:
+            raise HTTPException(status_code=401, detail="Session expired")
+        try:
+            new_token_data = await refresh_spotify_token(refresh_token)
+            user_tokens["access_token"] = new_token_data["access_token"]
+            user_tokens["expires_at"] = int(time.time()) + new_token_data["expires_in"]
+
+            if "refresh_token" in new_token_data:
+                user_tokens["refresh_token"] = new_token_data["refresh_token"]
+
+        except Exception:
+            raise HTTPException(status_code=401, detail="Authentication failed")
+    return user_tokens["access_token"]
+
+# Pydantic Models for incoming requests
+class PlaybackCommand(BaseModel):
+    action: str # "play", "pause", "next", "prev", "stop"
+    context_uri: Optional[str] = None # For playing specific playlists/albums
+
+class QueueCommand(BaseModel):
+    uri: str
+
+class TransferCommand(BaseModel):
+    device_id: str
+
+#State & Context Endpoints (Eyes and Ears)
+@app.get("/api/devices/raw")
+async def get_devices(authorization: str = Header(None)):
+    token = await _get_spotify_token(authorization)
+    async with httpx.AsyncClient() as client:
+        res = await client.get("https://api.spotify.com/v1/me/player/devices", headers={"Authorization": f"Bearer {token}"})
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=res.text)
+        return res.json()
+
+@app.get("/api/state", response_model=FrontendResponse)
+async def get_playback_state(access_token: str = Depends(get_valid_token)):
+    # Fetch raw state from client
+    raw_state = await spotify_client.fetch_playback_state(access_token)
+    
+    # Extract the actual track (if something is playing)
+    track_obj = raw_state.get("item")
+    
+    #  Pluck & Wrap for the normalizer
+    wrapped_state = {
+        "tracks": {
+            "items": [track_obj] if track_obj else []
+        }
+    }
+
+    normalized_list = normalize_spotify_data(wrapped_state)
+    top_hit = normalized_list[0] if normalized_list else None
+
+    return FrontendResponse(
+        status="success" if top_hit else "idle", # Let the UI know if Spotify is paused/empty
+        data=[], # No list needed for the "Now Playing" view
+        action="render", 
+        uri=top_hit.uri if top_hit else None,
+        name=top_hit.name if top_hit else None,
+        subtitle=top_hit.subtitle if top_hit else None,
+        coverart=top_hit.image if top_hit else None,
+        type=top_hit.type if top_hit else SpotifySearchType.TRACK
+    )
+
+@app.get("/api/queue")
+async def get_queue(authorization: str = Header(None)):
+    token = await _get_spotify_token(authorization)
+    raw_data = await spotify_client.fetch_queue(access_token=token)
+    current_playing_data = raw_data.get("currently_playing")
+    wrapped_current= {
+        "tracks":{
+            "items":[current_playing_data] if current_playing_data else []
+        }
+    }
+    normalized_current_list = normalize_spotify_data(wrapped_current)
+    top_hit= normalized_current_list[0] if normalized_current_list else None
+
+    queue_data = raw_data.get("queue",[])
+    wrapped_data = {
+        "tracks":{
+            "items":queue_data
+        }
+    }
+    normalized_data = normalize_spotify_data(wrapped_data)
+
+    return FrontendResponse(
+    status="success",
+    action="render",
+    data=normalized_data, # The queue list
+    uri=top_hit.uri if top_hit else None,
+    name=top_hit.name if top_hit else None,
+    subtitle=top_hit.subtitle if top_hit else None,
+    coverart=top_hit.image if top_hit else None,
+    type=top_hit.type if top_hit else SpotifySearchType.TRACK
+    )
+
+# 2. Action Endpoints (The Remote & DJ)
+@app.post("/api/playback")
+async def control_playback(command: PlaybackCommand, authorization: str = Header(None)):
+    token = await _get_spotify_token(authorization)
+    headers = {"Authorization": f"Bearer {token}"}
+    base_url = "https://api.spotify.com/v1/me/player"
+    
+    async with httpx.AsyncClient() as client:
+        if command.action == "next":
+            res = await client.post(f"{base_url}/next", headers=headers)
+        elif command.action == "prev":
+            res = await client.post(f"{base_url}/previous", headers=headers)
+        elif command.action in ["pause", "stop"]:
+            res = await client.put(f"{base_url}/pause", headers=headers)
+        elif command.action == "play":
+            payload = {"context_uri": command.context_uri} if command.context_uri else {}
+            res = await client.put(f"{base_url}/play", headers=headers, json=payload)
+        else:
+            raise HTTPException(status_code=400, detail="Unknown action")
+            
+        if res.status_code not in [200, 202, 404]:
+            raise HTTPException(status_code=res.status_code, detail=f"Spotify API Error: {res.text}")
+    return {"status": "success", "action_executed": command.action}
+
+@app.post("/api/queue")
+async def add_to_queue(command: QueueCommand, authorization: str = Header(None)):
+    token = await _get_spotify_token(authorization)
+    async with httpx.AsyncClient() as client:
+        res = await client.post(f"https://api.spotify.com/v1/me/player/queue?uri={command.uri}", headers={"Authorization": f"Bearer {token}"})
+        if res.status_code not in [200, 202, 204]: raise HTTPException(status_code=res.status_code, detail=res.text)
+    return {"status": "success", "queued": command.uri}
+
+@app.put("/api/playback/transfer")
+async def transfer_playback(command: TransferCommand, authorization: str = Header(None)):
+    token = await _get_spotify_token(authorization)
+    async with httpx.AsyncClient() as client:
+        payload = {"device_ids": [command.device_id], "play": True}
+        res = await client.put("https://api.spotify.com/v1/me/player", headers={"Authorization": f"Bearer {token}"}, json=payload)
+        if res.status_code not in [200, 202, 204]: raise HTTPException(status_code=res.status_code, detail=res.text)
+    return {"status": "success", "transferred_to": command.device_id}
+
+@app.put("/api/playback/shuffle")
+async def toggle_shuffle(state: bool, authorization: str = Header(None)):
+    token = await _get_spotify_token(authorization)
+    state_str = "true" if state else "false"
+    async with httpx.AsyncClient() as client:
+        res = await client.put(f"https://api.spotify.com/v1/me/player/shuffle?state={state_str}", headers={"Authorization": f"Bearer {token}"})
+        if res.status_code not in [200, 202, 204]: raise HTTPException(status_code=res.status_code, detail=res.text)
+    return {"status": "success", "shuffle": state}
+
+
+"""
+list of scopes potentially required-->
+user-modify-playback-state
+Description	Write access to a user’s playback state
+Visible to users	Control playback on your Spotify clients and Spotify Connect devices.
+
+user-read-currently-playing
+Description	Read access to a user’s currently playing content.
+Visible to users	Read your currently playing content.
+
+app-remote-control
+Description	Remote control playback of Spotify. This scope is currently available to Spotify iOS and Android SDKs.
+Visible to users	Communicate with the Spotify app on your device.
+
+streaming
+Description	Control playback of a Spotify track. This scope is currently available to the Web Playback SDK. The user must have a Spotify Premium account.
+Visible to users	Play content and control playback on your other devices.
+
+playlist-modify-public
+Description	Write access to a user's public playlists.
+Visible to users	Manage your public playlists.
+
+user-top-read
+Description	Read access to a user's top artists and tracks.
+Visible to users	Read your top artists and content
+
+user-library-modify
+Description	Write/delete access to a user's "Your Music" library.
+Visible to users	Manage your saved content.
+
+user-library-read
+Description	Read access to a user's library.
+Visible to users	Access your saved content.
+"""
+#websocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        # Maps an API Key (string) to a list of active WebSockets
+        self.active_connections: dict[str, list[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, api_key: str):
+        
+        await websocket.accept()
+        
+        if api_key not in self.active_connections:
+            self.active_connections[api_key]= []
+        
+        self.active_connections[api_key].append(websocket)
+        print(f"user with api_key = {api_key} is connected. Total devices: {len(self.active_connections[api_key])}")
+
+
+    def disconnect(self, websocket: WebSocket, api_key: str):
+        #ensuring the key exists as well as the websocket in the api_key list of websockets
+        if api_key in self.active_connections and websocket in self.active_connections[api_key]:
+            self.active_connections[api_key].remove(websocket)
+        if api_key in self.active_connections and not self.active_connections[api_key]:
+            self.active_connections.pop(api_key)
+            print(f"user {api_key} has fully disconnected ... ")
+
+    async def send_personal_json(self, message: dict, api_key: str):
+        if api_key in self.active_connections:
+            for wss in self.active_connections[api_key]:
+                try:
+                    await wss.send_json(message)
+                except Exception as e:
+                    print(f"failed to send message to a socket: {e}")
+manager = ConnectionManager()
+
+@app.websocket("/ws/{api_key}")
+async def websocket_endpoint(websocket:WebSocket, api_key:str):
+    await manager.connect(websocket,api_key)
+
+    try: 
+        while True:
+            #this is simply an infinite loop to keep our connection open and alive
+            #if we only connect and leave it then due to inactivity the connection will drop
+            #hence we are telling websocket to wait for text to come which in reality is not 
+            #coming at all
+            data = await websocket.receive_text()
+            #we are using receive text method so it throws an error when the websocket has
+            #disconnected and our client still tries to await receive_text(). this throws an
+            #exception which is caught by the block just below and acting as a mech to detect
+            #when the user closes the tab/device/...
+    except WebSocketDisconnect:
+        manager.disconnect(websocket,api_key)
+
+class PlaylistCreateRequest(BaseModel):
+    name: str
+    public: bool = True
+    description: Optional[str] = ""
+
+@app.post("/api/curate/playlist")
+async def create_user_playlist(
+    request: PlaylistCreateRequest, 
+    token: str = Depends(get_valid_token)
+):
+    url = "https://api.spotify.com/v1/me/playlists"
+    
+    body = {
+        "name": request.name,
+        "description": request.description,
+        "public": request.public,
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url=url, headers=headers, json=body) 
+            
+            if response.status_code == 201:
+                print("Playlist created successfully!")
+                playlist_data = response.json()
+                return {
+                    "status": "success",
+                    "playlist_id": playlist_data.get("id")
+                }
+            else:
+                raise HTTPException(status_code=response.status_code, detail=response.text)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+class TracksAddRequest(BaseModel):
+    uris: List[str]
+
+@app.post("/api/playlists/{playlist_id}/tracks")
+async def add_tracks_user_playlist(
+    playlist_id: str, 
+    request: TracksAddRequest, 
+    token: str = Depends(get_valid_token)
+):
+   
+    url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    body = {
+        "uris": request.uris,
+        "position": 0
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url=url, headers=headers, json=body)
+            
+            if response.status_code == 403:
+                raise HTTPException(status_code=403, detail=f"Forbidden: Cannot add items to {playlist_id}.")
+            elif response.status_code == 201:
+                return {
+                    "status": "success",
+                    "message": f"{len(request.uris)} tracks have been successfully added."
+                }
+            elif response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Spotify token expired. Please log in again.")
+            else:
+                raise HTTPException(status_code=response.status_code, detail=response.text)
+                
+        except httpx.ConnectError:
+            raise HTTPException(status_code=503, detail="Could not reach Spotify servers.")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"System crashed: {str(e)}")
+
+
+@app.get("/user/top/{type}", response_model=FrontendResponse)
+async def get_user_top_items(type: Literal["tracks", "artists"], access_token: str = Depends(get_valid_token)):
+    try:
+        raw_data = await spotify_client.fetch_user_top_items(item_type=type, access_token=access_token)
+        
+        # Because 'type' is literally either "tracks" or "artists", it perfectly matches 
+        # the root keys your normalize_spotify_data function looks for!
+        wrapped_data = {type: raw_data}
+        normalized_data = normalize_spotify_data(wrapped_data)
+        
+        return FrontendResponse(
+            status="success",
+            action="render",
+            data=normalized_data
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal Server Error - {str(e)}")
+
+
+@app.get("/api/artists/{artist_id}/albums", response_model=FrontendResponse)
+async def get_artist_albums(artist_id: str, access_token: str = Depends(get_valid_token)):
+    try:
+        raw_data = await spotify_client.fetch_artist_albums(artist_id=artist_id, access_token=access_token)
+        
+        # Wrap it for the normalizer
+        wrapped_data = {"albums": raw_data}
+        normalized_data = normalize_spotify_data(wrapped_data)
+        
+        return FrontendResponse(
+            status="success",
+            action="render",
+            data=normalized_data
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal Server Error - {str(e)}")
